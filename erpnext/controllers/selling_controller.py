@@ -318,9 +318,10 @@ class SellingController(StockController):
 			if is_internal_customer or not is_stock_item:
 				continue
 
-			if item.get("incoming_rate") and item.base_net_rate < (
+			rate_field = "valuation_rate" if self.doctype in ["Sales Order", "Quotation"] else "incoming_rate"
+			if item.get(rate_field) and item.base_net_rate < (
 				valuation_rate := flt(
-					item.incoming_rate * (item.conversion_factor or 1), item.precision("base_net_rate")
+					item.get(rate_field) * (item.conversion_factor or 1), item.precision("base_net_rate")
 				)
 			):
 				throw_message(
@@ -510,6 +511,9 @@ class SellingController(StockController):
 		if self.doctype not in ("Delivery Note", "Sales Invoice"):
 			return
 
+		if self.doctype == "Sales Invoice" and not self.update_stock and not self.is_internal_transfer():
+			return
+
 		from erpnext.stock.serial_batch_bundle import get_batch_nos, get_serial_nos
 
 		allow_at_arms_length_price = frappe.get_cached_value(
@@ -612,11 +616,11 @@ class SellingController(StockController):
 							if allow_at_arms_length_price:
 								continue
 
-							rate = flt(
-								flt(d.incoming_rate, d.precision("incoming_rate")) * d.conversion_factor,
-								d.precision("rate"),
-							)
-							if d.rate != rate:
+							rate = flt(flt(d.incoming_rate) * flt(d.conversion_factor or 1.0))
+
+							if flt(d.rate, d.precision("incoming_rate")) != flt(
+								rate, d.precision("incoming_rate")
+							):
 								d.rate = rate
 								frappe.msgprint(
 									_(
