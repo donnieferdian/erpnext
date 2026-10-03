@@ -770,6 +770,33 @@ def get_sre_reserved_serial_nos_details(
 	return frappe._dict(query.run())
 
 
+def get_sre_reserved_serial_nos_for_voucher_detail_nos(voucher_type: str, voucher_detail_nos: list) -> dict:
+	"""Returns {voucher_detail_no: set of reserved Serial Nos}, including the delivered ones."""
+
+	sre = frappe.qb.DocType("Stock Reservation Entry")
+	sb_entry = frappe.qb.DocType("Serial and Batch Entry")
+	query = (
+		frappe.qb.from_(sre)
+		.inner_join(sb_entry)
+		.on(sre.name == sb_entry.parent)
+		.select(sre.voucher_detail_no, sb_entry.serial_no)
+		.distinct()
+		.where(
+			(sre.docstatus == 1)
+			& (sre.voucher_type == voucher_type)
+			& (sre.voucher_detail_no.isin(voucher_detail_nos))
+			& (sre.reservation_based_on == "Serial and Batch")
+			& (sb_entry.serial_no.isnotnull())
+		)
+	)
+
+	reserved_serial_nos = {}
+	for voucher_detail_no, serial_no in query.run():
+		reserved_serial_nos.setdefault(voucher_detail_no, set()).add(serial_no)
+
+	return reserved_serial_nos
+
+
 def get_sre_reserved_batch_nos_details(
 	item_code: str, warehouse: str, batch_nos: list | None = None, ignore_voucher_nos: list | None = None
 ) -> dict:
@@ -814,6 +841,7 @@ def get_sre_details_for_voucher(voucher_type: str, voucher_no: str) -> list[dict
 		frappe.qb.from_(sre)
 		.select(
 			sre.name,
+			sre.company,
 			sre.item_code,
 			sre.warehouse,
 			sre.voucher_type,
@@ -868,7 +896,7 @@ def get_ssb_bundle_for_voucher(sre: dict) -> object:
 		bundle.posting_date = nowdate()
 		bundle.posting_time = nowtime()
 
-		for field in ("item_code", "warehouse", "has_serial_no", "has_batch_no"):
+		for field in ("company", "item_code", "warehouse", "has_serial_no", "has_batch_no"):
 			setattr(bundle, field, sre[field])
 
 		for sb_entry in sb_entries:
@@ -882,7 +910,7 @@ def get_ssb_bundle_for_voucher(sre: dict) -> object:
 def has_reserved_stock(voucher_type: str, voucher_no: str, voucher_detail_no: str | None = None) -> bool:
 	"""Returns True if there is any Stock Reservation Entry for the given voucher."""
 
-	if get_stock_reservation_entries_for_voucher(
+	if _get_stock_reservation_entries_for_voucher(
 		voucher_type, voucher_no, voucher_detail_no, fields=["name"], ignore_status=True
 	):
 		return True
@@ -1113,7 +1141,7 @@ def cancel_stock_reservation_entries(
 		sre_list = {}
 
 		if voucher_type and voucher_no:
-			sre_list = get_stock_reservation_entries_for_voucher(
+			sre_list = _get_stock_reservation_entries_for_voucher(
 				voucher_type, voucher_no, voucher_detail_no, fields=["name"]
 			)
 		elif from_voucher_type and from_voucher_no:
@@ -1156,6 +1184,24 @@ def get_stock_reservation_entries_for_voucher(
 ) -> list[dict]:
 	"""Returns list of Stock Reservation Entries against a Voucher."""
 
+	return _get_stock_reservation_entries_for_voucher(
+		voucher_type, voucher_no, voucher_detail_no, fields, ignore_status, ignore_permissions=False
+	)
+
+
+def _get_stock_reservation_entries_for_voucher(
+	voucher_type: str,
+	voucher_no: str,
+	voucher_detail_no: str | None = None,
+	fields: list[str] | None = None,
+	ignore_status: bool = False,
+	ignore_permissions: bool = True,
+) -> list[dict]:
+	"""Returns list of Stock Reservation Entries against a Voucher."""
+
+	if not ignore_permissions:
+		frappe.has_permission(voucher_type, doc=voucher_no, throw=True)
+
 	if not fields or not isinstance(fields, list):
 		fields = [
 			"name",
@@ -1169,13 +1215,10 @@ def get_stock_reservation_entries_for_voucher(
 
 	sre = frappe.qb.DocType("Stock Reservation Entry")
 	query = (
-		frappe.qb.from_(sre)
+		frappe.get_query(sre, fields=fields)
 		.where((sre.docstatus == 1) & (sre.voucher_type == voucher_type) & (sre.voucher_no == voucher_no))
 		.orderby(sre.creation)
 	)
-
-	for field in fields:
-		query = query.select(sre[field])
 
 	if voucher_detail_no:
 		query = query.where(sre.voucher_detail_no == voucher_detail_no)

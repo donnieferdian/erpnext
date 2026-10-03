@@ -249,6 +249,26 @@ class TestJobCard(FrappeTestCase):
 		# JC is Completed with excess transfer
 		self.assertEqual(job_card.status, "Completed")
 
+	def test_job_card_time_log_blocked_until_material_transfer(self):
+		"Time logs must wait for the transfer when RMs move against Job Card."
+		self.transfer_material_against = "Job Card"
+		self.source_warehouse = "Stores - _TC"
+
+		self.generate_required_stock(self.work_order)
+		job_card = frappe.get_last_doc("Job Card", {"work_order": self.work_order.name})
+
+		self.assertRaises(
+			frappe.ValidationError, job_card.add_time_log, frappe._dict(start_time=now(), employees=[])
+		)
+
+		transfer_entry = make_stock_entry_from_jc(job_card.name)
+		transfer_entry.insert()
+		transfer_entry.submit()
+
+		job_card.reload()
+		job_card.add_time_log(frappe._dict(start_time=now(), employees=[]))
+		self.assertTrue(job_card.time_logs)
+
 	@change_settings("Manufacturing Settings", {"job_card_excess_transfer": 0})
 	def test_job_card_excess_material_transfer_block(self):
 		self.transfer_material_against = "Job Card"
@@ -1136,6 +1156,19 @@ class TestJobCard(FrappeTestCase):
 		s4.submit()
 
 		assert_operating_costs(s4, 3, [s, s3])
+
+	def test_set_process_loss(self):
+		nothing_done = frappe.new_doc("Job Card")
+		nothing_done.for_quantity = 10
+		nothing_done.total_completed_qty = 0
+		nothing_done.set_process_loss()
+		self.assertEqual(nothing_done.process_loss_qty, 0)
+
+		all_process_loss = frappe.new_doc("Job Card")
+		all_process_loss.for_quantity = 10
+		all_process_loss.process_loss_qty = 10
+		all_process_loss.set_process_loss()
+		self.assertEqual(all_process_loss.process_loss_qty, 10)
 
 
 def create_bom_with_multiple_operations():

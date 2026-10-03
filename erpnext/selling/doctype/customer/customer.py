@@ -14,7 +14,7 @@ from frappe.contacts.address_and_contact import (
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.naming import set_name_by_naming_series, set_name_from_naming_options
 from frappe.model.utils.rename_doc import update_linked_doctypes
-from frappe.utils import cint, cstr, flt, get_formatted_email, today
+from frappe.utils import cint, cstr, flt, get_formatted_email, get_link_to_form, today
 from frappe.utils.deprecations import deprecated
 from frappe.utils.user import get_users_with_role
 
@@ -23,7 +23,10 @@ from erpnext.accounts.party import (
 	validate_party_accounts,
 	validate_party_currency_before_merging,
 )
-from erpnext.controllers.website_list_for_contact import add_role_for_portal_user
+from erpnext.controllers.website_list_for_contact import (
+	add_role_for_portal_user,
+	link_portal_users_to_contacts,
+)
 from erpnext.utilities.transaction_base import TransactionBase
 
 
@@ -162,7 +165,8 @@ class Customer(TransactionBase):
 				self.loyalty_program_tier = customer.loyalty_program_tier
 
 		if self.sales_team:
-			if sum(member.allocated_percentage or 0 for member in self.sales_team) != 100:
+			total = sum(flt(member.allocated_percentage) for member in self.sales_team)
+			if flt(total, self.precision("allocated_percentage", "sales_team")) != 100:
 				frappe.throw(_("Total contribution percentage should be equal to 100"))
 
 	@frappe.whitelist()
@@ -223,10 +227,15 @@ class Customer(TransactionBase):
 		)
 
 		if internal_customer:
+			internal_customer_link = get_link_to_form("Customer", internal_customer)
 			frappe.throw(
-				_("Internal Customer for company {0} already exists").format(
-					frappe.bold(self.represents_company)
-				)
+				_(
+					"Internal Customer {0} already exists for {1}. Disable it to make this Customer internal."
+				).format(
+					internal_customer_link,
+					frappe.bold(self.represents_company),
+				),
+				title=_("Internal Customer Already Exists"),
 			)
 
 	def on_update(self):
@@ -242,6 +251,8 @@ class Customer(TransactionBase):
 			self.copy_communication()
 
 		self.update_customer_groups()
+
+		link_portal_users_to_contacts(self)
 
 	def add_role_for_user(self):
 		for portal_user in self.portal_users:
@@ -430,15 +441,11 @@ def create_contact(contact, party_type, party, email):
 
 @frappe.whitelist()
 def make_quotation(source_name, target_doc=None):
-	def set_missing_values(source, target):
-		_set_missing_values(source, target)
-
 	target_doc = get_mapped_doc(
 		"Customer",
 		source_name,
 		{"Customer": {"doctype": "Quotation", "field_map": {"name": "party_name"}}},
 		target_doc,
-		set_missing_values,
 	)
 
 	target_doc.quotation_to = "Customer"
@@ -598,11 +605,8 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 
 			# if the current user does not have permissions to override credit limit,
 			# prompt them to send out an email to the controller users
-			frappe.msgprint(
-				message,
-				title=_("Credit Limit Crossed"),
-				raise_exception=1,
-				primary_action={
+			primary_action = (
+				{
 					"label": "Send Email",
 					"server_action": "erpnext.selling.doctype.customer.customer.send_emails",
 					"hide_on_success": True,
@@ -612,7 +616,16 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 						"credit_limit": credit_limit,
 						"credit_controller_users_list": credit_controller_users,
 					},
-				},
+				}
+				if frappe.has_permission("Customer", ptype="email", doc=customer)
+				else None
+			)
+
+			frappe.msgprint(
+				message,
+				title=_("Credit Limit Crossed"),
+				raise_exception=1,
+				primary_action=primary_action,
 			)
 
 
@@ -620,6 +633,7 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 def send_emails(args):
 	args = json.loads(args)
 	subject = _("Credit limit reached for customer {0}").format(args.get("customer"))
+	frappe.has_permission("Customer", ptype="email", doc=args.get("customer"), throw=True)
 	message = _("Credit limit has been crossed for customer {0} ({1}/{2})").format(
 		args.get("customer"), args.get("customer_outstanding"), args.get("credit_limit")
 	)
@@ -827,6 +841,15 @@ def make_address(args, is_primary_address=1, is_shipping_address=1):
 def get_customer_primary(doctype, txt, searchfield, start, page_len, filters):
 	customer = filters.get("customer")
 	type = filters.get("type")
+
+	# `type` is caller-supplied and was interpolated into qb.DocType(), so any doctype could be
+	# joined to Dynamic Link and read. The two pickers send only these values.
+	if type not in ("Contact", "Address"):
+		frappe.throw(_("Invalid type"), frappe.PermissionError)
+
+	# authorise the party, not Contact/Address: the `if_owner` row on Address would empty the picker rather than error
+	frappe.has_permission("Customer", doc=customer, throw=True)
+
 	type_doctype = qb.DocType(type)
 	dlink = qb.DocType("Dynamic Link")
 

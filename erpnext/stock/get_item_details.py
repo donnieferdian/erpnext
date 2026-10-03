@@ -7,6 +7,7 @@ import json
 import frappe
 from frappe import _, throw
 from frappe.model import child_table_fields, default_fields
+from frappe.model.document import Document
 from frappe.model.meta import get_field_precision
 from frappe.model.utils import get_fetch_values
 from frappe.query_builder.functions import IfNull, Sum
@@ -34,9 +35,34 @@ purchase_doctypes = [
 	"Purchase Invoice",
 ]
 
+maintain_same_rate_source_fields = {
+	"Purchase Order": {"supplier_quotation_item": "Supplier Quotation Item"},
+	"Purchase Receipt": {"purchase_order_item": "Purchase Order Item"},
+	"Purchase Invoice": {"po_detail": "Purchase Order Item", "pr_detail": "Purchase Receipt Item"},
+	"Sales Order": {"quotation_item": "Quotation Item"},
+	"Delivery Note": {"so_detail": "Sales Order Item", "si_detail": "Sales Invoice Item"},
+	"Sales Invoice": {"so_detail": "Sales Order Item", "dn_detail": "Delivery Note Item"},
+}
+
+LOCKED_RATE_FIELDS = [
+	"price_list_rate",
+	"rate",
+	"discount_percentage",
+	"discount_amount",
+	"margin_type",
+	"margin_rate_or_amount",
+]
+
+NOT_APPLICABLE_TAX = "N/A"
+
 
 @frappe.whitelist()
-def get_item_details(args, doc=None, for_validate=False, overwrite_warehouse=True):
+def get_item_details(
+	args: dict | str,
+	doc: Document | dict | str | None = None,
+	for_validate: bool | str | None = False,
+	overwrite_warehouse: bool | str = True,
+):
 	"""
 	args = {
 	        "item_code": "",
@@ -63,6 +89,7 @@ def get_item_details(args, doc=None, for_validate=False, overwrite_warehouse=Tru
 	for_validate = process_string_args(for_validate)
 	overwrite_warehouse = process_string_args(overwrite_warehouse)
 	item = frappe.get_cached_doc("Item", args.item_code)
+	item.check_permission()
 	validate_item_details(args, item)
 
 	if isinstance(doc, str):
@@ -97,16 +124,20 @@ def get_item_details(args, doc=None, for_validate=False, overwrite_warehouse=Tru
 	if args.get("doctype") in ["Purchase Order", "Purchase Receipt", "Purchase Invoice"]:
 		args.customer = None
 
-	out.update(get_price_list_rate(args, item))
+	source_row = get_rate_locked_source_row(args, doc)
+	if source_row:
+		lock_source_rate(out, source_row)
+	else:
+		out.update(get_price_list_rate(args, item))
 
-	if (
-		not out.price_list_rate
-		and args.transaction_type == "selling"
-		and frappe.get_single_value("Selling Settings", "fallback_to_default_price_list")
-	):
-		fallback_args = args.copy()
-		fallback_args.price_list = frappe.get_single_value("Selling Settings", "selling_price_list")
-		out.update(get_price_list_rate(fallback_args, item))
+		if (
+			not out.price_list_rate
+			and args.transaction_type == "selling"
+			and frappe.get_single_value("Selling Settings", "fallback_to_default_price_list")
+		):
+			fallback_args = args.copy()
+			fallback_args.price_list = frappe.get_single_value("Selling Settings", "selling_price_list")
+			out.update(get_price_list_rate(fallback_args, item))
 
 	args.customer = current_customer
 
@@ -121,9 +152,8 @@ def get_item_details(args, doc=None, for_validate=False, overwrite_warehouse=Tru
 		if args.get(key) is None:
 			args[key] = value
 
-	data = get_pricing_rule_for_item(args, doc=doc, for_validate=for_validate)
-
-	out.update(data)
+	if not source_row:
+		out.update(get_pricing_rule_for_item(args, doc=doc, for_validate=for_validate))
 
 	if (
 		frappe.db.get_single_value("Stock Settings", "auto_create_serial_and_batch_bundle_for_outward")
@@ -153,6 +183,61 @@ def remove_standard_fields(details):
 	return details
 
 
+@frappe.request_cache
+def has_source_doc_permission(doctype: str, docname: str, user: str) -> bool:
+	return frappe.has_permission(doctype, doc=docname, user=user)
+
+
+def get_rate_locked_source_row(args, doc):
+	"""Reads the source row from the DB, not the mutable target row, so an unsaved edit can't override the locked rate."""
+	if isinstance(doc, str):
+		doc = json.loads(doc)
+
+	source_fields = maintain_same_rate_source_fields.get(args.parenttype or args.doctype)
+	if not source_fields or not doc or args.get("is_return") or not maintain_same_rate_enabled(args):
+		return None
+
+	row = (
+		next((d for d in doc.get("items") or [] if d.get("name") == args.child_docname), None)
+		if args.child_docname
+		else args
+	)
+	if not row:
+		return None
+
+	for link_field, source_doctype in source_fields.items():
+		if source_name := row.get(link_field):
+			# don't leak another document's pricing to a caller without read access
+			source = frappe.db.get_value(
+				source_doctype, source_name, [*LOCKED_RATE_FIELDS, "parent", "parenttype"], as_dict=True
+			)
+			if source and has_source_doc_permission(source.parenttype, source.parent, frappe.session.user):
+				return source
+			return None
+	return None
+
+
+def maintain_same_rate_enabled(transaction_args):
+	if (transaction_args.parenttype or transaction_args.doctype) in purchase_doctypes:
+		if transaction_args.get("is_internal_supplier"):
+			return False
+		return bool(cint(frappe.get_cached_value("Buying Settings", "None", "maintain_same_rate")))
+
+	if transaction_args.get("is_internal_customer"):
+		return False
+	return bool(cint(frappe.get_cached_value("Selling Settings", "None", "maintain_same_sales_rate")))
+
+
+def lock_source_rate(out, source_row):
+	"""Copies the full pricing block so a manual discount or margin on the source row survives."""
+	out.price_list_rate = flt(source_row.get("price_list_rate")) or flt(source_row.get("rate"))
+	out.rate = flt(source_row.get("rate"))
+	out.discount_percentage = flt(source_row.get("discount_percentage"))
+	out.discount_amount = flt(source_row.get("discount_amount"))
+	out.margin_type = source_row.get("margin_type")
+	out.margin_rate_or_amount = flt(source_row.get("margin_rate_or_amount"))
+
+
 def set_valuation_rate(out, args):
 	if frappe.db.exists("Product Bundle", {"name": args.item_code, "disabled": 0}, cache=True):
 		valuation_rate = 0.0
@@ -160,7 +245,7 @@ def set_valuation_rate(out, args):
 
 		for bundle_item in bundled_items.items:
 			valuation_rate += flt(
-				get_valuation_rate(bundle_item.item_code, args.company, out.get("warehouse")).get(
+				_get_valuation_rate(bundle_item.item_code, args.company, out.get("warehouse")).get(
 					"valuation_rate"
 				)
 				* bundle_item.qty
@@ -169,7 +254,7 @@ def set_valuation_rate(out, args):
 		out.update({"valuation_rate": valuation_rate})
 
 	else:
-		out.update(get_valuation_rate(args.item_code, args.company, out.get("warehouse")))
+		out.update(_get_valuation_rate(args.item_code, args.company, out.get("warehouse")))
 
 
 def update_bin_details(args, out, doc):
@@ -805,7 +890,10 @@ def get_item_tax_map(company, item_tax_template, as_json=True):
 		template = frappe.get_cached_doc("Item Tax Template", item_tax_template)
 		for d in template.taxes:
 			if frappe.get_cached_value("Account", d.tax_type, "company") == company:
-				item_tax_map[d.tax_type] = d.tax_rate
+				if d.get("not_applicable"):
+					item_tax_map[d.tax_type] = NOT_APPLICABLE_TAX
+				else:
+					item_tax_map[d.tax_type] = d.tax_rate
 
 	return json.dumps(item_tax_map) if as_json else item_tax_map
 
@@ -1339,6 +1427,11 @@ def get_pos_profile(company, pos_profile=None, user=None):
 	if not user:
 		user = frappe.session["user"]
 
+	allowed_pos_profiles = frappe.get_list("POS Profile", pluck="name")
+
+	if not allowed_pos_profiles:
+		return None
+
 	pf = frappe.qb.DocType("POS Profile")
 	pfu = frappe.qb.DocType("POS Profile User")
 
@@ -1348,6 +1441,7 @@ def get_pos_profile(company, pos_profile=None, user=None):
 		.on(pf.name == pfu.parent)
 		.select(pf.star)
 		.where((pfu.user == user) & (pfu.default == 1))
+		.where(pf.name.isin(allowed_pos_profiles))
 	)
 
 	if company:
@@ -1362,6 +1456,7 @@ def get_pos_profile(company, pos_profile=None, user=None):
 			.on(pf.name == pfu.parent)
 			.select(pf.star)
 			.where((pf.company == company) & (pf.disabled == 0))
+			.where(pf.name.isin(allowed_pos_profiles))
 		).run(as_dict=True)
 
 	return pos_profile and pos_profile[0] or None
@@ -1400,6 +1495,10 @@ def get_conversion_factor(item_code, uom):
 
 @frappe.whitelist()
 def get_projected_qty(item_code, warehouse):
+	# record-level read on the item, matching what get_item_details() in this file already does.
+	# Nothing in the tree calls this, so there is no caller whose roles constrain the choice.
+	frappe.has_permission("Item", doc=item_code, throw=True)
+
 	return {
 		"projected_qty": frappe.db.get_value(
 			"Bin", {"item_code": item_code, "warehouse": warehouse}, "projected_qty"
@@ -1409,6 +1508,9 @@ def get_projected_qty(item_code, warehouse):
 
 @frappe.whitelist()
 def get_bin_details(item_code, warehouse, company=None, include_child_warehouses=False):
+	# `select`, not `read`: the selling/buying rows and SellingController reach this with no Item read row
+	frappe.has_permission("Item", ptype="select", throw=True)
+
 	bin_details = {"projected_qty": 0, "actual_qty": 0, "reserved_qty": 0}
 
 	if warehouse:
@@ -1516,13 +1618,21 @@ def apply_price_list(args, as_doc=False, doc=None):
 
 def apply_price_list_on_item(args, doc=None):
 	item_doc = frappe.db.get_value("Item", args.item_code, ["name", "variant_of"], as_dict=1)
-	item_details = get_price_list_rate(args, item_doc)
+
+	source_row = get_rate_locked_source_row(args, doc)
+	if source_row:
+		item_details = frappe._dict()
+		lock_source_rate(item_details, source_row)
+	else:
+		item_details = get_price_list_rate(args, item_doc)
 
 	args.conversion_factor = flt(args.conversion_factor) or get_conversion_factor(
 		args.item_code, args.uom
 	).get("conversion_factor", 1)
 	args.stock_qty = flt(args.qty) * flt(args.conversion_factor)
-	item_details.update(get_pricing_rule_for_item(args, doc=doc))
+
+	if not source_row:
+		item_details.update(get_pricing_rule_for_item(args, doc=doc))
 
 	return item_details
 
@@ -1584,6 +1694,16 @@ def get_default_bom(item_code=None):
 
 @frappe.whitelist()
 def get_valuation_rate(item_code, company, warehouse=None):
+	"""Whitelisted entry point: authorise the item, then return its cost price."""
+	frappe.has_permission("Item", doc=item_code, throw=True)
+	frappe.has_permission("Company", doc=company, ptype="select", throw=True)
+
+	return _get_valuation_rate(item_code, company, warehouse)
+
+
+def _get_valuation_rate(item_code, company, warehouse=None):
+	# no guard here: set_valuation_rate calls this for the item AND for every Product Bundle
+	# component, and a caller entitled to the bundle is not necessarily entitled to each component
 	if frappe.get_cached_value("Warehouse", warehouse, "is_group"):
 		return {"valuation_rate": 0.0}
 

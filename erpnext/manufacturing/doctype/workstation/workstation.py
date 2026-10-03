@@ -152,9 +152,10 @@ class Workstation(Document):
 
 		for bom_no in bom_list:
 			frappe.db.sql(
-				"""update `tabBOM Operation` set hour_rate = %s
+				"""update `tabBOM Operation`
+				set hour_rate = %s, operating_cost = %s * time_in_mins / 60
 				where parent = %s and workstation = %s""",
-				(self.hour_rate, bom_no[0], self.name),
+				(self.hour_rate, self.hour_rate, bom_no[0], self.name),
 			)
 
 	def validate_workstation_holiday(self, schedule_date, skip_holiday_list_check=False):
@@ -188,7 +189,6 @@ class Workstation(Document):
 		for row in doc.time_logs:
 			if not row.to_time:
 				row.to_time = to_time
-				row.time_in_mins = time_diff_in_hours(row.to_time, row.from_time) / 60
 				row.completed_qty = qty
 
 		doc.save()
@@ -376,31 +376,32 @@ def get_workstations(**kwargs):
 	frappe.has_permission("Workstation", "read", throw=True)
 
 	kwargs = frappe._dict(kwargs)
-	_workstation = frappe.qb.DocType("Workstation")
 
-	query = (
-		frappe.qb.from_(_workstation)
-		.select(
-			_workstation.name,
-			_workstation.description,
-			_workstation.status,
-			_workstation.on_status_image,
-			_workstation.off_status_image,
-		)
-		.orderby(_workstation.workstation_type, _workstation.name)
-		.where(_workstation.plant_floor == kwargs.plant_floor)
-	)
+	if not kwargs.plant_floor:
+		# the replaced query compared `plant_floor` with `=`, which no row satisfies when empty;
+		# get_list would read that as IS NULL and start returning floor-less workstations
+		return []
+
+	# A list of filters, not a dict: more than one of these can constrain `name`, and a dict would
+	# silently drop all but the last.
+	filters = [["plant_floor", "=", kwargs.plant_floor]]
 
 	if kwargs.workstation:
-		query = query.where(_workstation.name == kwargs.workstation)
+		filters.append(["name", "=", kwargs.workstation])
 
 	if kwargs.workstation_type:
-		query = query.where(_workstation.workstation_type == kwargs.workstation_type)
+		filters.append(["workstation_type", "=", kwargs.workstation_type])
 
 	if kwargs.workstation_status:
-		query = query.where(_workstation.status == kwargs.workstation_status)
+		filters.append(["status", "=", kwargs.workstation_status])
 
-	data = query.run(as_dict=True)
+	# get_list, not get_all: it applies the caller's User Permissions to rows the doctype check does not scope
+	data = frappe.get_list(
+		"Workstation",
+		filters=filters,
+		fields=["name", "description", "status", "on_status_image", "off_status_image"],
+		order_by="workstation_type, name",
+	)
 
 	color_map = {
 		"Production": "var(--green-600)",
@@ -413,10 +414,10 @@ def get_workstations(**kwargs):
 
 	for d in data:
 		d.workstation_name = get_link_to_form("Workstation", d.name)
-		d.status_image = d.on_status_image
+		d.status_image = frappe.utils.escape_html(d.on_status_image)
 		d.background_color = color_map.get(d.status, "var(--red-600)")
 		d.workstation_link = get_url_to_form("Workstation", d.name)
 		if d.status != "Production":
-			d.status_image = d.off_status_image
+			d.status_image = frappe.utils.escape_html(d.off_status_image)
 
 	return data

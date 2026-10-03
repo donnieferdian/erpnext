@@ -13,6 +13,7 @@ from frappe.query_builder import DocType, Interval
 from frappe.query_builder.functions import Now
 from frappe.utils import flt, get_fullname
 
+from erpnext.accounts.party import validate_party_frozen_disabled
 from erpnext.crm.utils import (
 	CRMNote,
 	copy_comments,
@@ -131,7 +132,9 @@ class Opportunity(TransactionBase, CRMNote):
 		self.validate_item_details()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_cust_name()
+		self.validate_party()
 		self.map_fields()
+		self.validate_qty()
 		self.set_exchange_rate()
 
 		if not self.title:
@@ -141,6 +144,15 @@ class Opportunity(TransactionBase, CRMNote):
 
 	def on_update(self):
 		self.update_prospect()
+
+	def validate_qty(self):
+		for item in self.items:
+			if flt(item.qty) <= 0:
+				frappe.throw(
+					_("Row #{0}: Quantity must be greater than 0 for Item {1}").format(
+						item.idx, item.item_code
+					)
+				)
 
 	def map_fields(self):
 		for field in self.meta.get_valid_columns():
@@ -277,13 +289,17 @@ class Opportunity(TransactionBase, CRMNote):
 			self.save()
 
 		else:
-			frappe.throw(_("Cannot declare as lost, because Quotation has been made."))
+			frappe.throw(_("Cannot declare as Lost because an active Quotation exists."))
 
 	def has_active_quotation(self):
 		if not self.get("items", []):
 			return frappe.get_all(
 				"Quotation",
-				{"opportunity": self.name, "status": ("not in", ["Lost", "Closed"]), "docstatus": 1},
+				{
+					"opportunity": self.name,
+					"status": ("not in", ["Lost", "Cancelled", "Expired"]),
+					"docstatus": 1,
+				},
 				"name",
 			)
 		else:
@@ -292,14 +308,20 @@ class Opportunity(TransactionBase, CRMNote):
 				select q.name
 				from `tabQuotation` q, `tabQuotation Item` qi
 				where q.name = qi.parent and q.docstatus=1 and qi.prevdoc_docname =%s
-				and q.status not in ('Lost', 'Closed')""",
+				and q.status not in ('Lost', 'Cancelled', 'Expired')""",
 				self.name,
 			)
 
 	def has_ordered_quotation(self):
 		if not self.get("items", []):
 			return frappe.get_all(
-				"Quotation", {"opportunity": self.name, "status": "Ordered", "docstatus": 1}, "name"
+				"Quotation",
+				{
+					"opportunity": self.name,
+					"status": ("in", ["Ordered", "Partially Ordered"]),
+					"docstatus": 1,
+				},
+				"name",
 			)
 		else:
 			return frappe.db.sql(
@@ -307,7 +329,7 @@ class Opportunity(TransactionBase, CRMNote):
 				select q.name
 				from `tabQuotation` q, `tabQuotation Item` qi
 				where q.name = qi.parent and q.docstatus=1 and qi.prevdoc_docname =%s
-				and q.status = 'Ordered'""",
+				and q.status in ('Ordered', 'Partially Ordered')""",
 				self.name,
 			)
 
@@ -325,6 +347,10 @@ class Opportunity(TransactionBase, CRMNote):
 			if self.has_active_quotation():
 				return False
 			return True
+
+	def validate_party(self) -> None:
+		if self.opportunity_from == "Customer":
+			validate_party_frozen_disabled("Customer", self.party_name)
 
 	def validate_cust_name(self):
 		if self.party_name:
@@ -527,8 +553,14 @@ def make_opportunity_from_communication(
 ):
 	from erpnext.crm.doctype.lead.lead import make_lead_from_communication
 
+	# `communication` is caller-supplied. Communication grants read to `All` only for the owner and
+	# carries a has_permission hook, so doc= is what decides access.
+	frappe.has_permission("Communication", doc=communication, throw=True)
+
 	doc = frappe.get_doc("Communication", communication)
 
+	# make_lead_from_communication() carries its own check, but it is skipped entirely when the
+	# email already references a Lead, so this cannot rely on it.
 	lead = doc.reference_name if doc.reference_doctype == "Lead" else None
 	if not lead:
 		lead = make_lead_from_communication(communication, ignore_communication_links=True)

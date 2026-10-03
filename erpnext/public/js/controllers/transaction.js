@@ -561,9 +561,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		var update_stock = 0, show_batch_dialog = 0;
 		item.weight_per_unit = 0;
 		item.weight_uom = '';
-		if(!item.barcode){
-			item.uom = null // make UOM blank to update the existing UOM when item changes
-		}
+		item.uom = null // make UOM blank to update the existing UOM when item changes
 		item.conversion_factor = 0;
 
 		if(['Sales Invoice', 'Purchase Invoice'].includes(this.frm.doc.doctype)) {
@@ -820,6 +818,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			}
 
 			$.each(item_tax_map, function(tax, rate) {
+				if (rate === erpnext.NOT_APPLICABLE_TAX) {
+					return;
+				}
 				let found = (me.frm.doc.taxes || []).find(d => d.account_head === tax);
 				if(!found) {
 					let child = frappe.model.add_child(me.frm.doc, "taxes");
@@ -1613,9 +1614,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		}
 
 		if (this.frm.doc.taxes && this.frm.doc.taxes.length > 0) {
-			this.frm.set_currency_labels(["tax_amount", "total", "tax_amount_after_discount"], this.frm.doc.currency, "taxes");
+			this.frm.set_currency_labels(["net_amount", "tax_amount", "total", "tax_amount_after_discount"], this.frm.doc.currency, "taxes");
 
-			this.frm.set_currency_labels(["base_tax_amount", "base_total", "base_tax_amount_after_discount"], company_currency, "taxes");
+			this.frm.set_currency_labels(["base_net_amount", "base_tax_amount", "base_total", "base_tax_amount_after_discount"], company_currency, "taxes");
 		}
 
 		if (this.frm.doc.advances && this.frm.doc.advances.length > 0) {
@@ -2366,8 +2367,10 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			method: me.get_method_for_payment(),
 			args: args,
 			callback: function(r) {
-				var doclist = frappe.model.sync(r.message);
-				frappe.set_route("Form", doclist[0].doctype, doclist[0].name);
+				if (!r.exc) {
+					var doclist = frappe.model.sync(r.message);
+					frappe.set_route("Form", doclist[0].doctype, doclist[0].name);
+				}
 			}
 		});
 	}

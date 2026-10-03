@@ -820,6 +820,7 @@ class TestWorkOrder(FrappeTestCase):
 				self.assertEqual(row.qty, 10)
 
 				bundle_id = frappe.get_doc("Serial and Batch Bundle", row.serial_and_batch_bundle)
+				self.assertEqual(bundle_id.company, ste1.company)
 				for bundle_row in bundle_id.get("entries"):
 					self.assertTrue(bundle_row.batch_no in batches)
 					batches.remove(bundle_row.batch_no)
@@ -834,6 +835,7 @@ class TestWorkOrder(FrappeTestCase):
 				self.assertEqual(row.qty, 20)
 
 				bundle_id = frappe.get_doc("Serial and Batch Bundle", row.serial_and_batch_bundle)
+				self.assertEqual(bundle_id.company, ste1.company)
 				for bundle_row in bundle_id.get("entries"):
 					self.assertTrue(bundle_row.batch_no in batches)
 					remaining_batches.append(bundle_row.batch_no)
@@ -1045,6 +1047,20 @@ class TestWorkOrder(FrappeTestCase):
 
 		wo.load_from_db()
 		self.assertEqual(wo.status, "Completed")
+
+		from erpnext.stock.stock_balance import get_planned_qty
+
+		completed_planned_qty = get_bin(wo.production_item, wo.fg_warehouse).planned_qty
+		expected_completed_qty = get_planned_qty(wo.production_item, wo.fg_warehouse)
+
+		se.cancel()
+		wo.reload()
+		self.assertEqual(wo.status, "In Process")
+		cancelled_planned_qty = get_bin(wo.production_item, wo.fg_warehouse).planned_qty
+		expected_cancelled_qty = get_planned_qty(wo.production_item, wo.fg_warehouse)
+
+		self.assertEqual(completed_planned_qty, expected_completed_qty)
+		self.assertEqual(cancelled_planned_qty, expected_cancelled_qty)
 
 	@timeout(seconds=60)
 	def test_job_card_scrap_item(self):
@@ -3286,6 +3302,42 @@ class TestWorkOrder(FrappeTestCase):
 		manufacture_entry.submit()
 
 		frappe.db.set_single_value("Manufacturing Settings", "validate_components_quantities_per_bom", 0)
+
+	def test_transferred_qty_sums_item_and_its_alternate(self):
+		# Base item + its alternate transfers must sum onto the required row, not overwrite.
+		fg_item = "Test FG Item For Alternate Transferred Qty"
+		source_warehouse = "Stores - _TC"
+		raw_material = "Test RM For Alternate Transferred Qty"
+		alternate_item = "Alternate Test RM For Alternate Transferred Qty"
+
+		make_item(fg_item, {"is_stock_item": 1})
+		for item in [raw_material, alternate_item]:
+			make_item(item, {"is_stock_item": 1, "allow_alternative_item": 1})
+			test_stock_entry.make_stock_entry(item_code=item, target=source_warehouse, qty=10, basic_rate=100)
+
+		frappe.get_doc(
+			{
+				"doctype": "Item Alternative",
+				"item_code": raw_material,
+				"alternative_item_code": alternate_item,
+				"two_way": 1,
+			}
+		).insert()
+
+		make_bom(item=fg_item, source_warehouse=source_warehouse, raw_materials=[raw_material])
+		wo = make_wo_order_test_record(item=fg_item, qty=10, source_warehouse=source_warehouse)
+
+		# 6 as the base item
+		frappe.get_doc(make_stock_entry(wo.name, "Material Transfer for Manufacture", 6)).submit()
+		# 4 as the alternate item, linked back to the base
+		alt_transfer = frappe.get_doc(make_stock_entry(wo.name, "Material Transfer for Manufacture", 4))
+		alt_transfer.items[0].item_code = alternate_item
+		alt_transfer.items[0].original_item = raw_material
+		alt_transfer.submit()
+
+		wo.reload()
+		self.assertEqual(wo.required_items[0].transferred_qty, 10)
+		self.assertEqual(wo.material_transferred_for_manufacturing, 10)
 
 	def test_components_qty_for_bom_based_manufacture_entry(self):
 		frappe.db.set_single_value("Manufacturing Settings", "backflush_raw_materials_based_on", "BOM")

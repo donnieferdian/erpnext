@@ -63,10 +63,12 @@ from erpnext.controllers.print_settings import (
 )
 from erpnext.controllers.sales_and_purchase_return import validate_return
 from erpnext.exceptions import InvalidCurrency
+from erpnext.selling.doctype.party_specific_item.party_specific_item import get_party_specific_items
 from erpnext.setup.utils import get_exchange_rate
 from erpnext.stock.doctype.item.item import get_uom_conv_factor
 from erpnext.stock.doctype.packed_item.packed_item import make_packing_list
 from erpnext.stock.get_item_details import (
+	NOT_APPLICABLE_TAX,
 	_get_item_tax_template,
 	_get_item_tax_template_from_item_group,
 	get_bin_details,
@@ -74,6 +76,11 @@ from erpnext.stock.get_item_details import (
 	get_item_details,
 	get_item_tax_map,
 	get_item_warehouse,
+)
+from erpnext.stock.utils import (
+	is_group_warehouse,
+	validate_disabled_warehouse,
+	validate_warehouse_company,
 )
 from erpnext.utilities.regional import temporary_flag
 from erpnext.utilities.transaction_base import TransactionBase
@@ -247,6 +254,8 @@ class AccountsController(TransactionBase):
 		if self.get("_action") and self._action != "update_after_submit":
 			self.set_missing_values(for_validate=True)
 
+		self.validate_price_list()
+
 		if self.get("_action") == "submit":
 			self.remove_bundle_for_non_stock_invoices()
 
@@ -258,6 +267,7 @@ class AccountsController(TransactionBase):
 			if self.is_return:
 				self.validate_qty()
 			else:
+				self.clear_stale_deferred_fields()
 				self.validate_deferred_start_and_end_date()
 
 		self.validate_inter_company_reference()
@@ -289,6 +299,7 @@ class AccountsController(TransactionBase):
 		self.validate_all_documents_schedule()
 
 		self.validate_party()
+		self.validate_party_specific_items()
 		self.validate_currency()
 		self.validate_party_account_currency()
 		self.validate_return_against_account()
@@ -376,6 +387,53 @@ class AccountsController(TransactionBase):
 	@staticmethod
 	def is_drop_ship(items):
 		return any(item.delivered_by_supplier for item in items)
+
+	def validate_price_list(self):
+		if self.get("selling_price_list"):
+			price_list_field, transaction_side = "selling_price_list", "selling"
+		else:
+			price_list_field, transaction_side = "buying_price_list", "buying"
+
+		price_list = self.get(price_list_field)
+		if not price_list:
+			return
+
+		details = (
+			frappe.db.get_value("Price List", price_list, ["enabled", transaction_side], as_dict=True)
+			or frappe._dict()
+		)
+
+		# An internal transfer carries the price list of the outward document into the inward one.
+		fits_transaction = details.get(transaction_side) or self.is_internal_transfer()
+		if details.enabled and fits_transaction:
+			return
+
+		# Returns retain a submitted voucher's pricing even if its price list no longer fits.
+		if (
+			self.get("is_return")
+			and self.get("return_against")
+			and price_list
+			== frappe.db.get_value(
+				self.doctype, {"name": self.return_against, "docstatus": 1}, price_list_field
+			)
+		):
+			return
+
+		if not details.enabled:
+			frappe.throw(
+				_("Price List {0} is disabled").format(get_link_to_form("Price List", price_list)),
+				title=_("Disabled Price List"),
+			)
+
+		if transaction_side == "selling":
+			message = _("Price List {0} cannot be used on a selling transaction")
+		else:
+			message = _("Price List {0} cannot be used on a buying transaction")
+
+		frappe.throw(
+			message.format(get_link_to_form("Price List", price_list)),
+			title=_("Invalid Price List"),
+		)
 
 	def set_default_letter_head(self):
 		if hasattr(self, "letter_head") and not self.letter_head:
@@ -643,6 +701,23 @@ class AccountsController(TransactionBase):
 		if self.get("from_date") and self.get("to_date") and getdate(self.from_date) > getdate(self.to_date):
 			frappe.throw(_("To Date cannot be before From Date"), title=_("Invalid Auto Repeat Date"))
 
+	def clear_stale_deferred_fields(self):
+		field_map = {
+			"Sales Invoice": "deferred_revenue_account",
+			"Purchase Invoice": "deferred_expense_account",
+		}
+		account_field = field_map.get(self.doctype)
+
+		for item in self.get("items"):
+			if item.get("enable_deferred_revenue") or item.get("enable_deferred_expense"):
+				continue
+
+			item.service_start_date = None
+			item.service_end_date = None
+			item.service_stop_date = None
+			if account_field:
+				item.set(account_field, None)
+
 	def validate_deferred_start_and_end_date(self):
 		for d in self.items:
 			if d.get("enable_deferred_revenue") or d.get("enable_deferred_expense"):
@@ -696,6 +771,8 @@ class AccountsController(TransactionBase):
 			self.validate_non_invoice_documents_schedule()
 
 	def before_print(self, settings=None):
+		self.set_missing_terms()
+
 		if self.doctype in [
 			"Purchase Order",
 			"Sales Order",
@@ -718,6 +795,16 @@ class AccountsController(TransactionBase):
 
 		set_print_templates_for_item_table(self, settings)
 		set_print_templates_for_taxes(self, settings)
+
+	def set_missing_terms(self):
+		if not self.get("tc_name") or self.get("terms"):
+			return
+
+		from erpnext.setup.doctype.terms_and_conditions.terms_and_conditions import (
+			get_terms_and_conditions,
+		)
+
+		self.terms = get_terms_and_conditions(self.tc_name, self.as_dict())
 
 	def calculate_paid_amount(self):
 		if hasattr(self, "is_pos") or hasattr(self, "is_paid"):
@@ -1231,6 +1318,11 @@ class AccountsController(TransactionBase):
 		if self.get("taxes") or self.get("is_pos"):
 			return
 
+		# set by the Opening Invoice Creation Tool, where the outstanding amount
+		# entered against a party is already inclusive of tax
+		if self.flags.dont_auto_add_taxes:
+			return
+
 		if frappe.get_single_value(
 			"Accounts Settings", "add_taxes_from_taxes_and_charges_template"
 		) and hasattr(self, "taxes_and_charges"):
@@ -1259,7 +1351,10 @@ class AccountsController(TransactionBase):
 			if isinstance(item_tax_rate, str):
 				item_tax_rate = parse_json(item_tax_rate)
 
-			for account_head, _rate in item_tax_rate.items():
+			for account_head, rate in item_tax_rate.items():
+				if rate == NOT_APPLICABLE_TAX:
+					continue
+
 				row = self.get_tax_row(account_head)
 
 				if not row:
@@ -1869,7 +1964,7 @@ class AccountsController(TransactionBase):
 
 	def is_payable_account(self, reference_doctype, account):
 		if reference_doctype == "Purchase Invoice" or (
-			reference_doctype == "Journal Entry"
+			reference_doctype in ("Journal Entry", "Payment Entry")
 			and frappe.get_cached_value("Account", account, "account_type") == "Payable"
 		):
 			return True
@@ -2394,6 +2489,56 @@ class AccountsController(TransactionBase):
 	def validate_party(self):
 		party_type, party = self.get_party()
 		validate_party_frozen_disabled(party_type, party)
+
+	def validate_party_specific_items(self):
+		party_type, party = self.get_party()
+		if self.get("quotation_to") == "Customer":
+			party = self.party_name
+		if not party:
+			return
+
+		allowed_values = get_party_specific_items(party)
+		rows = self.get_rows_for_item_restrictions() if allowed_values else []
+		if not rows:
+			return
+
+		allowed_items = frappe.get_all(
+			"Item",
+			filters=[["name", "in", list({row.item_code for row in rows})]]
+			+ [[field, "in", values] for field, values in allowed_values.items()],
+			pluck="name",
+		)
+		for row in rows:
+			if row.item_code not in allowed_items:
+				frappe.throw(
+					_("Row {0}: Item {1} is not allowed for {2} {3}.").format(
+						row.idx, frappe.bold(row.item_code), _(party_type), frappe.bold(party)
+					),
+					title=_("Item Restricted for Party"),
+				)
+
+	def get_rows_for_item_restrictions(self):
+		"""Skip return rows that reverse a submitted row of the original document."""
+		rows = [row for row in self.get("items") if row.item_code]
+		if not (self.get("is_return") and self.get("return_against")):
+			return rows
+
+		reference_field = (
+			"dn_detail" if self.doctype == "Delivery Note" else frappe.scrub(self.doctype) + "_item"
+		)
+		original_items = dict(
+			frappe.get_all(
+				f"{self.doctype} Item",
+				filters={"parent": self.return_against, "docstatus": 1},
+				fields=["name", "item_code"],
+				as_list=True,
+			)
+		)
+		return [
+			row
+			for row in rows
+			if flt(row.qty) > 0 or original_items.get(row.get(reference_field)) != row.item_code
+		]
 
 	def get_party(self):
 		party_type = None
@@ -3131,10 +3276,21 @@ def get_tax_rate(account_head):
 	return frappe.get_cached_value("Account", account_head, ["tax_rate", "account_name"], as_dict=True)
 
 
+# the only doctypes a `taxes_and_charges` Link points at; `master_doctype` is caller-supplied and reaches get_doc()
+TAX_MASTER_DOCTYPES = ("Sales Taxes and Charges Template", "Purchase Taxes and Charges Template")
+
+
+def validate_tax_master(master_doctype):
+	if master_doctype not in TAX_MASTER_DOCTYPES:
+		frappe.throw(_("Invalid tax master doctype"), frappe.PermissionError)
+
+
 @frappe.whitelist()
 def get_default_taxes_and_charges(master_doctype, tax_template=None, company=None):
 	if not company:
 		return {}
+
+	validate_tax_master(master_doctype)
 
 	if tax_template and company:
 		tax_template_company = frappe.get_cached_value(master_doctype, tax_template, "company")
@@ -3153,6 +3309,9 @@ def get_default_taxes_and_charges(master_doctype, tax_template=None, company=Non
 def get_taxes_and_charges(master_doctype, master_name):
 	if not master_name:
 		return
+
+	validate_tax_master(master_doctype)
+
 	from frappe.model import child_table_fields, default_fields
 
 	tax_master = frappe.get_doc(master_doctype, master_name)
@@ -3686,8 +3845,11 @@ def add_taxes_from_tax_template(child_item, parent_doc, db_insert=True):
 
 	if child_item.get("item_tax_rate") and add_taxes_from_item_tax_template:
 		tax_map = json.loads(child_item.get("item_tax_rate"))
-		for tax_type in tax_map:
-			tax_rate = flt(tax_map[tax_type])
+		for tax_type, tax_rate in tax_map.items():
+			if tax_rate == NOT_APPLICABLE_TAX:
+				continue
+
+			tax_rate = flt(tax_rate)
 			taxes = parent_doc.get("taxes") or []
 			# add new row for tax head only if missing
 			found = any(tax.account_head == tax_type for tax in taxes)
@@ -3722,7 +3884,7 @@ def set_order_defaults(parent_doctype, parent_doctype_name, child_doctype, child
 	child_item.update({date_fieldname: trans_item.get(date_fieldname) or p_doc.get(date_fieldname)})
 	child_item.stock_uom = item.stock_uom
 	child_item.uom = trans_item.get("uom") or item.stock_uom
-	child_item.warehouse = get_item_warehouse(item, p_doc, overwrite_warehouse=True)
+	child_item.warehouse = get_new_child_item_warehouse(p_doc, item, trans_item, child_doctype)
 	conversion_factor = flt(get_conversion_factor(item.item_code, child_item.uom).get("conversion_factor"))
 	child_item.conversion_factor = flt(trans_item.get("conversion_factor")) or conversion_factor
 	child_item.update(get_bin_details(child_item.item_code, child_item.warehouse, p_doc.get("company")))
@@ -3731,18 +3893,43 @@ def set_order_defaults(parent_doctype, parent_doctype_name, child_doctype, child
 		# Initialized value will update in parent validation
 		child_item.base_rate = 1
 		child_item.base_amount = 1
-	if child_doctype == "Sales Order Item":
-		child_item.warehouse = get_item_warehouse(item, p_doc, overwrite_warehouse=True)
-		if not child_item.warehouse:
-			frappe.throw(
-				_(
-					"Cannot find a default warehouse for item {0}. Please set one in the Item Master or in Stock Settings."
-				).format(frappe.bold(item.item_code))
-			)
 
 	set_child_tax_template_and_map(item, child_item, p_doc)
 	add_taxes_from_tax_template(child_item, p_doc)
 	return child_item
+
+
+def get_new_child_item_warehouse(p_doc, item, trans_item: dict, child_doctype: str) -> str | None:
+	"""Return the warehouse picked in the Update Items dialog, else the configured default.
+
+	Validates whichever warehouse was resolved, since a submitted parent skips validate().
+	"""
+	warehouse = trans_item.get("warehouse") or get_item_warehouse(item, p_doc, overwrite_warehouse=True)
+
+	if not warehouse:
+		if is_warehouse_required_for_new_child_item(child_doctype, item, trans_item):
+			frappe.throw(
+				_(
+					"Cannot find a default warehouse for item {0}. Please select one in the Update Items dialog, or set a default in the Item Master or in Stock Settings."
+				).format(frappe.bold(item.item_code))
+			)
+		return None
+
+	validate_warehouse_company(warehouse, p_doc.company)
+	validate_disabled_warehouse(warehouse)
+	is_group_warehouse(warehouse)
+	return warehouse
+
+
+def is_warehouse_required_for_new_child_item(child_doctype: str, item, trans_item: dict) -> bool:
+	"""Sales Order always needs one; buying documents only for stock rows, as in validate_stock_item_warehouse."""
+	if child_doctype == "Sales Order Item":
+		return True
+
+	if child_doctype in ("Purchase Order Item", "Supplier Quotation Item"):
+		return bool(item.is_stock_item and flt(trans_item.get("qty")) and not item.delivered_by_supplier)
+
+	return False
 
 
 def validate_child_on_delete(row, parent, ordered_item=None):
